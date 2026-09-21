@@ -1,7 +1,9 @@
 # DNS SOA 序列号推进审计 API
 
 基于 **Python + FastAPI**，按 [RFC 1982](https://www.rfc-editor.org/rfc/rfc1982) 序列号环形算术，
-对多个 DNS 副本当前持有的 32 位无符号 SOA 序列号与拟发布值进行推进审计，并推导最优发布候选。
+对多个 DNS 副本当前持有的 32 位无符号 SOA 序列号与拟发布值进行推进审计，
+推导最优发布候选，规划各副本的 IXFR / AXFR 传输，
+并在字节预算内选择要保留的增量集合。
 
 ## 一条命令启动（Docker Compose）
 
@@ -221,15 +223,112 @@ curl -s http://localhost:8000/transfer-plan \
 # {"...","mode":"axfr","reason":"target_incomparable","ordered_deltas":[]}
 ```
 
+### `POST /retention-plan` — 字节预算内的增量保留规划
+
+给定目标 SOA 序列号、一组**带字节数**的无序 IXFR 增量（`from_serial`、`to_serial`、`bytes`）、
+各副本当前值与非负 `priority`（**至多 12 个副本**），以及总字节预算 `budget`：
+在 `used_bytes <= budget` 的约束下选择要**保留**的增量子集，使
+**拥有到目标完整链的副本 priority 总和最大**，并依次按以下规则确定唯一结果：
+
+1. 被覆盖副本（`ixfr` + `up_to_date`）的 **priority 总和最大**；
+2. 被覆盖**副本数最多**；
+3. **占用字节最少**；
+4. 按 `(from_serial, to_serial)` 升序排列的**增量序列字典序最小**。
+
+增量校验复用 `/transfer-plan` 的环形链路规则（非严格 newer、分叉均为 422），并新增：
+同一 `(from_serial, to_serial)` 携带**不同 `bytes`** 时返回 **422**（`error=delta_bytes_conflict`）；
+完全相同的重复增量去重。副本数超过 12 返回 **422**（`error=too_many_replicas`）。
+
+每个副本的结果 `mode`（复用 `plan_transfer` 在**完整**增量集合上的判定）：
+
+| `mode` | 条件 | `reason` |
+|---|---|---|
+| `up_to_date` | 当前值已等于目标（不占用预算，恒视为已覆盖） | `null` |
+| `ixfr` | 到目标的完整链被保留集覆盖 | `null` |
+| `axfr` | 完整集合下即存在**缺口**（保留任何子集都无法连通） | `"gap"` |
+| `axfr` | 完整集合下即形成**环路** | `"loop"` |
+| `axfr` | 当前值与目标在 RFC 1982 下**不可比较**（前向距离恰为 2³¹） | `"target_incomparable"` |
+| `axfr` | 完整集合下存在完整链，但因**预算**未被保留 | `"budget"` |
+
+> 保留集恰为被覆盖副本需求集（各自完整链上的增量）之并——共享链的副本只计一次字节，
+> 对覆盖无贡献的增量不会被保留。**预算无法保留任何完整链时仍返回 200**
+> （`retained_deltas` 为空、`used_bytes` 为 0，相关副本标记 `axfr / budget`）。
+
+请求（预算 12 恰好保住 `ns-a` 的完整链，`ns-b` 因共享链后缀被一并覆盖）：
+
+```bash
+curl -s http://localhost:8000/retention-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "target": 4,
+    "budget": 12,
+    "replicas": [
+      {"name": "ns-a", "current": 1, "priority": 10},
+      {"name": "ns-b", "current": 3, "priority": 5},
+      {"name": "ns-c", "current": 4, "priority": 100},
+      {"name": "ns-d", "current": 7, "priority": 1}
+    ],
+    "deltas": [
+      {"from_serial": 3, "to_serial": 4, "bytes": 6},
+      {"from_serial": 1, "to_serial": 2, "bytes": 3},
+      {"from_serial": 2, "to_serial": 3, "bytes": 3},
+      {"from_serial": 1, "to_serial": 2, "bytes": 3}
+    ]
+  }'
+```
+
+响应（`retained_deltas` 按 `(from_serial, to_serial)` 升序，`results` 保持副本输入顺序）：
+
+```json
+{
+  "target": 4,
+  "budget": 12,
+  "used_bytes": 12,
+  "retained_deltas": [
+    {"from_serial": 1, "to_serial": 2, "bytes": 3},
+    {"from_serial": 2, "to_serial": 3, "bytes": 3},
+    {"from_serial": 3, "to_serial": 4, "bytes": 6}
+  ],
+  "results": [
+    {"name": "ns-a", "current": 1, "target": 4, "mode": "ixfr", "reason": null},
+    {"name": "ns-b", "current": 3, "target": 4, "mode": "ixfr", "reason": null},
+    {"name": "ns-c", "current": 4, "target": 4, "mode": "up_to_date", "reason": null},
+    {"name": "ns-d", "current": 7, "target": 4, "mode": "axfr", "reason": "gap"}
+  ]
+}
+```
+
+预算不足时（例如上例中 `budget` 改为 11）仍返回 200：
+
+```json
+{
+  "target": 4,
+  "budget": 11,
+  "used_bytes": 6,
+  "retained_deltas": [
+    {"from_serial": 3, "to_serial": 4, "bytes": 6}
+  ],
+  "results": [
+    {"name": "ns-a", "current": 1, "target": 4, "mode": "axfr", "reason": "budget"},
+    {"name": "ns-b", "current": 3, "target": 4, "mode": "ixfr", "reason": null},
+    {"name": "ns-c", "current": 4, "target": 4, "mode": "up_to_date", "reason": null},
+    {"name": "ns-d", "current": 7, "target": 4, "mode": "axfr", "reason": "gap"}
+  ]
+}
+```
+
 ### 输入校验（422）
 
 以下情况返回 **422 Unprocessable Entity**：
 
 - 序列号越界：必须为整数且在 `[0, 4294967295]`（即 `[0, 2^32-1]`）；
-- 副本名重复（`/audit`、`/propose`、`/transfer-plan` 均检查）；
+- 副本名重复（`/audit`、`/propose`、`/transfer-plan`、`/retention-plan` 均检查）；
 - 副本名为空 / `replicas` 为空数组；
 - `/transfer-plan` 额外检查：增量非严格 newer（`delta_not_strictly_newer`）、
-  同一 `from_serial` 分叉（`delta_fork`）。
+  同一 `from_serial` 分叉（`delta_fork`）；
+- `/retention-plan` 额外检查：副本数超过 12（`too_many_replicas`）、
+  相同增量携带不同 `bytes`（`delta_bytes_conflict`）、
+  `bytes` / `priority` / `budget` 为负数或非整数。
 
 ## 算法说明
 
@@ -248,10 +347,24 @@ curl -s http://localhost:8000/transfer-plan \
 注意严格 newer 的边构成的合法环路只能跨 2³² 回绕（至少 3 条边、各边前向距离之和恰为 2³²），
 两条边无法在不违反严格 newer 的前提下成环。
 
+`/retention-plan` 中，带字节数的增量先经 `build_sized_delta_chain` 校验去重为
+`from_serial -> to_serial` 映射与 `(from_serial, to_serial) -> bytes` 映射；
+`plan_retention` 先在**完整**集合上对每个副本跑 `plan_transfer`：
+`up_to_date` 恒被覆盖（零成本），`ixfr` 副本的链上增量即其**需求集**，
+`gap` / `loop` / `target_incomparable` 在完整集合下即不可达、原因保持。
+由于链是单后继映射，副本被子集覆盖当且仅当其需求集被该子集包含，
+因此最优保留集必为某组副本需求集之并；副本数不超过 12，
+枚举全部副本子集（至多 2¹² = 4096 个，位掩码按位 OR 求并集）即可精确求得
+`(priority 总和, 覆盖副本数, -占用字节)` 字典序最大的子集，
+再在同分子集中取增量序列（按 `(from_serial, to_serial)` 升序）字典序最小者。
+空子集恒可行（`budget >= 0`），故预算再小也能正常返回 200。
+
 ## 测试
 
 核心环形算术不依赖 FastAPI，可直接用标准库运行（另含小位宽空间对暴力穷举的对照测试，
-以及 `/transfer-plan` 的去重、分叉、缺口、环路、回绕与正对点测试）：
+`/transfer-plan` 的去重、分叉、缺口、环路、回绕与正对点测试，
+以及 `/retention-plan` 的字节数冲突、共享链并集、三级平局裁决、
+`budget` 原因与零预算测试）：
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -263,11 +376,12 @@ python3 -m unittest discover -s tests -v
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py        # FastAPI 路由与异常（/audit、/propose、/transfer-plan）
+│   ├── main.py        # FastAPI 路由与异常（/audit、/propose、/transfer-plan、/retention-plan）
 │   ├── schemas.py     # 请求/响应模型与 422 校验
-│   └── serial.py      # RFC 1982 环形算术与增量链规划（纯函数，零第三方依赖）
+│   └── serial.py      # RFC 1982 环形算术、增量链规划与保留规划（纯函数，零第三方依赖）
 ├── tests/test_serial.py
 ├── tests/test_transfer_plan.py
+├── tests/test_retention_plan.py
 ├── requirements.txt
 ├── Dockerfile
 ├── compose.yaml

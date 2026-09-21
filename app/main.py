@@ -13,15 +13,22 @@ from .schemas import (
     ProposeItem,
     ProposeRequest,
     ProposeResponse,
+    RetainedDelta,
+    RetentionPlanItem,
+    RetentionPlanRequest,
+    RetentionPlanResponse,
     TransferPlanItem,
     TransferPlanRequest,
     TransferPlanResponse,
 )
 from .serial import (
+    MAX_RETENTION_REPLICAS,
     build_delta_chain,
+    build_sized_delta_chain,
     compare_serial,
     DeltaValidationError,
     forward_distance,
+    plan_retention,
     plan_transfer,
     propose_serial,
 )
@@ -30,9 +37,10 @@ app = FastAPI(
     title="DNS SOA 序列号推进审计 API",
     description=(
         "基于 RFC 1982 环形算术，对多个 DNS 副本的 SOA 序列号推进进行审计，"
-        "并推导对所有副本都严格更新的最佳拟发布值。"
+        "推导对所有副本都严格更新的最佳拟发布值，规划增量 / 全量传输，"
+        "并在字节预算内选择要保留的增量集合。"
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
@@ -183,3 +191,76 @@ def transfer_plan(request: TransferPlanRequest) -> TransferPlanResponse:
         )
 
     return TransferPlanResponse(target=request.target, results=results)
+
+
+@app.post("/retention-plan", response_model=RetentionPlanResponse)
+def retention_plan(request: RetentionPlanRequest) -> RetentionPlanResponse:
+    """在字节预算内选择要保留的增量集合（副本数不超过 12）。
+
+    先对带字节数的无序增量集合做整体校验（422）：
+
+    * 每条增量的 to_serial 必须按 RFC 1982 严格新于 from_serial；
+    * 完全相同的重复增量去重；
+    * 相同增量（同一 from_serial、to_serial）携带不同 bytes 即冲突，拒绝；
+    * 同一 from_serial 指向不同 to_serial 的分叉增量被拒绝。
+
+    再按环形链路规则为每个副本求出到目标的完整链（需求集），在
+    ``used_bytes <= budget`` 的约束下选择保留集，依次：
+
+    1. 最大化拥有到目标完整链的副本 priority 总和；
+    2. 最大化被覆盖副本数；
+    3. 最小化占用字节数；
+    4. 取增量序列（按 from_serial、to_serial 升序）字典序最小者。
+
+    逐副本标记：完整链被保留为 ``ixfr``；当前值已等于目标为
+    ``up_to_date``；否则 ``axfr`` 并给出 ``gap`` / ``loop`` /
+    ``target_incomparable`` / ``budget``（完整集合下有完整链但因预算
+    未被保留）原因。预算无法保留任何完整链时仍返回 200（保留集为空）。
+    """
+    _check_duplicate_names([r.name for r in request.replicas])
+    if len(request.replicas) > MAX_RETENTION_REPLICAS:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "too_many_replicas",
+                "message": f"副本数不得超过 {MAX_RETENTION_REPLICAS}",
+                "limit": MAX_RETENTION_REPLICAS,
+                "got": len(request.replicas),
+            },
+        )
+
+    raw_deltas = [(d.from_serial, d.to_serial, d.bytes) for d in request.deltas]
+    try:
+        chain, sizes = build_sized_delta_chain(raw_deltas)
+    except DeltaValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.detail)
+
+    retained, used_bytes, modes = plan_retention(
+        request.target,
+        [(r.current, r.priority) for r in request.replicas],
+        chain,
+        sizes,
+        request.budget,
+    )
+
+    results = [
+        RetentionPlanItem(
+            name=replica.name,
+            current=replica.current,
+            target=request.target,
+            mode=mode,
+            reason=reason,
+        )
+        for replica, (mode, reason) in zip(request.replicas, modes)
+    ]
+
+    return RetentionPlanResponse(
+        target=request.target,
+        budget=request.budget,
+        used_bytes=used_bytes,
+        retained_deltas=[
+            RetainedDelta(from_serial=frm, to_serial=to, bytes=sizes[(frm, to)])
+            for frm, to in retained
+        ],
+        results=results,
+    )
