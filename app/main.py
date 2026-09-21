@@ -13,15 +13,21 @@ from .schemas import (
     ProposeItem,
     ProposeRequest,
     ProposeResponse,
+    RetentionDelta,
+    RetentionPlanItem,
+    RetentionPlanRequest,
+    RetentionPlanResponse,
     TransferPlanItem,
     TransferPlanRequest,
     TransferPlanResponse,
 )
 from .serial import (
     build_delta_chain,
+    build_sized_delta_chain,
     compare_serial,
     DeltaValidationError,
     forward_distance,
+    plan_retention,
     plan_transfer,
     propose_serial,
 )
@@ -183,3 +189,75 @@ def transfer_plan(request: TransferPlanRequest) -> TransferPlanResponse:
         )
 
     return TransferPlanResponse(target=request.target, results=results)
+
+
+@app.post("/retention-plan", response_model=RetentionPlanResponse)
+def retention_plan(request: RetentionPlanRequest) -> RetentionPlanResponse:
+    """在字节预算内选择要保留的 IXFR 增量集合。
+
+    复用 :func:`build_delta_chain` 的全部增量合法性 / 环形链路规则，并额外
+    要求完全相同的重复增量携带相同 ``bytes``，否则返回 **422**
+    （``error=delta_bytes_conflict``）；非严格 newer、分叉同样返回 422。
+
+    副本数不超过 12。先逐副本复用 :func:`plan_transfer` 的追踪判定
+    （``gap`` / ``loop`` / ``target_incomparable`` 无论保留哪些增量都只能
+    AXFR；当前值已等于目标的副本天然 ``ixfr`` 且不占字节），再穷举副本子集，
+    在总字节预算内选择保留集合，依次：
+
+    1. 最大化拥有到目标完整链（``ixfr``）副本的 **priority 总和**；
+    2. 最大化覆盖副本数；
+    3. 最小化保留增量占用字节；
+    4. 最小化保留增量序列字典序（按 ``(from_serial, to_serial)`` 排序）。
+
+    存在完整链但保留集合无法覆盖的副本标记为 ``axfr / budget``。
+    预算不足以保留任何完整链时保留集合为空、``used_bytes=0``，仍返回 200。
+    """
+    _check_duplicate_names([r.name for r in request.replicas])
+
+    raw_deltas = [
+        (d.from_serial, d.to_serial, d.bytes) for d in request.deltas
+    ]
+    try:
+        chain, sizes = build_sized_delta_chain(raw_deltas)
+    except DeltaValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.detail)
+
+    retained, used_bytes, planned = plan_retention(
+        [(r.current, r.priority) for r in request.replicas],
+        request.target,
+        chain,
+        sizes,
+        request.budget,
+    )
+
+    retained_deltas = [
+        RetentionDelta(
+            from_serial=frm, to_serial=to, bytes=sizes[(frm, to)]
+        )
+        for frm, to in retained
+    ]
+
+    results = []
+    for replica, (mode, reason, ordered) in zip(request.replicas, planned):
+        results.append(
+            RetentionPlanItem(
+                name=replica.name,
+                current=replica.current,
+                target=request.target,
+                priority=replica.priority,
+                mode=mode,
+                reason=reason,
+                ordered_deltas=[
+                    OrderedDelta(from_serial=frm, to_serial=to)
+                    for frm, to in ordered
+                ],
+            )
+        )
+
+    return RetentionPlanResponse(
+        target=request.target,
+        budget=request.budget,
+        retained_deltas=retained_deltas,
+        used_bytes=used_bytes,
+        results=results,
+    )

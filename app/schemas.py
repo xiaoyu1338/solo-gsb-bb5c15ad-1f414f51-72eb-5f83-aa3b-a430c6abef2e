@@ -177,3 +177,123 @@ class TransferPlanResponse(BaseModel):
 
     target: int
     results: List[TransferPlanItem]
+
+
+# ---------------------------------------------------------------------------
+# POST /retention-plan
+# ---------------------------------------------------------------------------
+
+RetentionReason = Literal["gap", "loop", "target_incomparable", "budget"]
+
+
+class SizedIxfrDelta(IxfrDelta):
+    """一条带字节数的无序 IXFR 增量。"""
+
+    bytes: int = Field(
+        ...,
+        ge=0,
+        description="该增量占用的字节数（非负整数）；相同增量字节数不一致返回 422",
+    )
+
+    @field_validator("bytes", mode="before")
+    @classmethod
+    def _bytes_nonneg_int(cls, value: object) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("bytes 必须是非负整数")
+        if value < 0:
+            raise ValueError("bytes 必须是非负整数")
+        return value
+
+
+class ReplicaWithPriority(ReplicaCurrent):
+    """单个副本当前持有的序列号及其保留优先级。"""
+
+    priority: int = Field(
+        ...,
+        ge=0,
+        description="非负优先级：优先让高 priority 副本拥有到目标的完整链",
+    )
+
+    @field_validator("priority", mode="before")
+    @classmethod
+    def _priority_nonneg_int(cls, value: object) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("priority 必须是非负整数")
+        if value < 0:
+            raise ValueError("priority 必须是非负整数")
+        return value
+
+
+class RetentionPlanRequest(BaseModel):
+    """POST /retention-plan 请求体。"""
+
+    target: int = Field(..., description="目标 32 位无符号 SOA 序列号")
+    replicas: List[ReplicaWithPriority] = Field(
+        ..., min_length=1, max_length=12,
+        description="副本列表（1 ~ 12 个，名称不可重复）",
+    )
+    deltas: List[SizedIxfrDelta] = Field(
+        ..., description="一组带字节数的无序 IXFR 增量（允许重复，分叉将被拒绝）",
+    )
+    budget: int = Field(..., description="保留增量的总字节预算（非负整数）")
+
+    @field_validator("target", mode="before")
+    @classmethod
+    def _target_serial32(cls, value: object) -> int:
+        return _coerce_serial32(value)
+
+    @field_validator("budget", mode="before")
+    @classmethod
+    def _budget_nonneg_int(cls, value: object) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("budget 必须是非负整数")
+        if value < 0:
+            raise ValueError("budget 必须是非负整数")
+        return value
+
+
+class RetentionDelta(BaseModel):
+    """被保留的单条 IXFR 增量（按 (from_serial, to_serial) 字典序返回）。"""
+
+    from_serial: int
+    to_serial: int
+    bytes: int = Field(..., description="该增量占用的字节数")
+
+
+class RetentionPlanItem(BaseModel):
+    """单个副本的保留规划结果（顺序与请求中的副本一致）。"""
+
+    name: str
+    current: int
+    target: int
+    priority: int
+    mode: Literal["ixfr", "axfr"] = Field(
+        ...,
+        description=(
+            "ixfr：保留集合覆盖了从当前值到目标的完整增量链"
+            "（当前值已等于目标时 ordered_deltas 为空）；axfr：需全量传输"
+        ),
+    )
+    reason: Optional[RetentionReason] = Field(
+        ...,
+        description=(
+            "仅 axfr 时给出原因：gap / loop / target_incomparable / budget"
+        ),
+    )
+    ordered_deltas: List[OrderedDelta] = Field(
+        ..., description="ixfr 时按从当前值到目标的顺序给出增量；axfr 时为空",
+    )
+
+
+class RetentionPlanResponse(BaseModel):
+    """POST /retention-plan 响应体。"""
+
+    target: int
+    budget: int
+    retained_deltas: List[RetentionDelta] = Field(
+        ..., description="被保留的增量（按 (from_serial, to_serial) 字典序）",
+    )
+    used_bytes: int = Field(
+        ..., ge=0, description="被保留增量占用的总字节数（<= budget）",
+    )
+    results: List[RetentionPlanItem]
